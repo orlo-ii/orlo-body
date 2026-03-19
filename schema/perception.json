@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "orlo-body perception message",
+  "description": "State snapshot or event from a body adapter",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["type", "body_id", "pose", "vitals"],
+      "properties": {
+        "type": {"const": "state"},
+        "ts": {"type": "number"},
+        "body_id": {"type": "string"},
+        "pose": {
+          "type": "object",
+          "properties": {
+            "x": {"type": "number"},
+            "y": {"type": "number"},
+            "z": {"type": "number"},
+            "yaw": {"type": "number"},
+            "pitch": {"type": "number"}
+          },
+          "required": ["x", "y", "z"]
+        },
+        "velocity": {
+          "type": "object",
+          "properties": {
+            "x": {"type": "number"},
+            "y": {"type": "number"},
+            "z": {"type": "number"}
+          }
+        },
+        "vitals": {
+          "type": "object",
+          "properties": {
+            "health": {"type": "number", "minimum": 0, "maximum": 1},
+            "energy": {"type": "number", "minimum": 0, "maximum": 1},
+            "status": {"type": "string", "enum": ["idle", "moving", "working", "fighting", "fleeing", "dead"]}
+          },
+          "required": ["health", "energy", "status"]
+        },
+        "environment": {
+          "type": "object",
+          "properties": {
+            "nearby_entities": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "type": {"type": "string"},
+                  "distance": {"type": "number"},
+                  "bearing": {"type": "number"}
+                },
+                "required": ["name", "type", "distance"]
+              }
+            },
+            "nearby_objects": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "type": {"type": "string"},
+                  "distance": {"type": "number"}
+                },
+                "required": ["name", "type", "distance"]
+              }
+            },
+            "surface": {"type": "string"},
+            "time": {"type": "object"}
+          }
+        },
+        "inventory": {
+          "type": "object",
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "count": {"type": "integer"}
+                },
+                "required": ["name", "count"]
+              }
+            },
+            "equipped": {"type": "string"}
+          }
+        },
+        "ext": {"type": "object"}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "body_id", "event"],
+      "properties": {
+        "type": {"const": "event"},
+        "ts": {"type": "number"},
+        "body_id": {"type": "string"},
+        "event": {"type": "string"},
+        "data": {"type": "object"}
+      }
+    }
+  ]
+}

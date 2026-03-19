@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "orlo-body action message",
+  "description": "Action command or query from Orlo to a body",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["type", "action"],
+      "properties": {
+        "type": {"const": "action"},
+        "action_id": {"type": "string"},
+        "body_id": {"type": "string"},
+        "action": {
+          "type": "string",
+          "enum": [
+            "move_to", "move_to_entity", "follow", "stop", "look_at",
+            "use", "grab", "place", "give", "equip", "craft", "consume",
+            "attack", "flee",
+            "say", "say_to", "emote",
+            "ext"
+          ]
+        },
+        "params": {"type": "object"}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "query"],
+      "properties": {
+        "type": {"const": "query"},
+        "query_id": {"type": "string"},
+        "body_id": {"type": "string"},
+        "query": {"type": "string", "enum": ["capabilities", "inspect", "status"]}
+      }
+    }
+  ]
+}
