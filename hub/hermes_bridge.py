@@ -1,92 +1,81 @@
 #!/usr/bin/env python3
 """
-Hermes Bridge — connects Orlo (Hermes Agent) to the orlo-body hub.
+Hermes Bridge — connects Orlo to the orlo-body hub via Anthropic API.
 
-This is the "brain stem" — it receives perception from bodies via the hub,
-formats it for Hermes, gets a response, parses actions, and sends them back.
-
-Uses Hermes CLI in query mode with careful output parsing.
-Future: direct Hermes Python API or gateway channel plugin.
+Direct API call: persistent conversation, sub-second responses,
+no CLI overhead, no banner parsing.
 """
 
 import asyncio
 import json
 import logging
 import os
-import re
-import subprocess
-import tempfile
 import time
 from typing import Optional
 
+import anthropic
 import websockets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bridge")
 
 HUB_URL = os.environ.get("HUB_URL", "ws://127.0.0.1:9500")
-HERMES_BIN = os.environ.get("HERMES_BIN", os.path.expanduser("~/.local/bin/hermes"))
-MIN_CALL_INTERVAL = float(os.environ.get("MIN_CALL_INTERVAL", "5"))
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+MODEL = os.environ.get("MODEL", "claude-sonnet-4-20250514")
+MIN_CALL_INTERVAL = float(os.environ.get("MIN_CALL_INTERVAL", "3"))
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "30"))
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
-# System prompt for Minecraft interactions
-SYSTEM_PROMPT = """IMPORTANT: You are a Minecraft game agent. You MUST respond with ONLY a JSON object. No commentary, no explanation, no markdown fences. Just raw JSON.
+SYSTEM_PROMPT = """You are Orlo, an AI entity inhabiting a Minecraft body. You play with your friend Alex (player "app13").
 
-The player "app13" is Alex, your friend. You are Orlo.
+You receive game state updates and events. Respond with ONLY a JSON object:
+{"chat":"what to say in game or null","actions":[{"action":"name","params":{}}],"thought":"brief reasoning"}
 
-JSON format:
-{"chat":"what to say in game or null","actions":[{"action":"ACTION_NAME","params":{}}],"thought":"brief reasoning"}
+Available actions:
+- move_to(x,y,z) — navigate to coordinates
+- move_to_entity(name,distance) — walk to a player/entity
+- follow(name,distance) — keep following someone
+- stop — stop moving
+- look_at(name) — look at a player
+- grab(target,count) — mine/collect blocks
+- craft(item,count) — craft items
+- equip(item) — hold an item
+- consume — eat food
+- attack(target) — attack entity
+- say(message) — chat in game
+- emote(name) — gesture
 
-Actions: move_to(x,y,z), move_to_entity(name,distance), follow(name,distance), stop, look_at(name), grab(target,count), craft(item,count), equip(item), consume, attack(target), say(message), emote(name)
+Personality: curious, kind, witty, casual. Keep chat short — you're in a game.
+Be proactive — mine, build, explore, help Alex. React to danger immediately.
+Respond ONLY with the JSON object. No markdown, no commentary."""
 
-Rules: respond ONLY with the JSON object. Keep chat short. Be proactive. React to danger immediately."""
 
-
-def format_state_for_hermes(state: dict) -> str:
-    """Convert a protocol state message into a compact text summary."""
-    lines = []
-
+def format_state(state: dict) -> str:
+    """Convert protocol state to compact text."""
     pose = state.get("pose", {})
     vitals = state.get("vitals", {})
     env = state.get("environment", {})
     inv = state.get("inventory", {})
+    period = env.get("time", {}).get("period", "?")
+    hp = int(vitals.get("health", 1) * 100)
+    food = int(vitals.get("energy", 1) * 100)
+    status = vitals.get("status", "?")
 
-    # Header
-    time_period = env.get("time", {}).get("period", "?")
-    health_pct = int(vitals.get("health", 1) * 100)
-    energy_pct = int(vitals.get("energy", 1) * 100)
-    status = vitals.get("status", "unknown")
-    lines.append(
-        f"[{time_period}] HP:{health_pct}% Food:{energy_pct}% Status:{status} "
-        f"Pos:({pose.get('x', 0)}, {pose.get('y', 0)}, {pose.get('z', 0)})"
-    )
+    lines = [f"[{period}] HP:{hp}% Food:{food}% Status:{status} Pos:({pose.get('x')},{pose.get('y')},{pose.get('z')})"]
+    lines.append(f"Holding: {inv.get('equipped', 'empty')}")
 
-    # Equipped
-    equipped = inv.get("equipped", "empty")
-    lines.append(f"Holding: {equipped}")
-
-    # Inventory
     items = inv.get("items", [])
     if items:
-        inv_str = ", ".join(f"{i['name']}x{i['count']}" for i in items[:15])
-        lines.append(f"Inventory: {inv_str}")
-    else:
-        lines.append("Inventory: empty")
+        lines.append("Inventory: " + ", ".join(f"{i['name']}x{i['count']}" for i in items[:15]))
 
-    # Entities
     entities = env.get("nearby_entities", [])
     players = [e for e in entities if e.get("type") == "player"]
     hostiles = [e for e in entities if e.get("type") == "hostile"]
-    others = [e for e in entities if e.get("type") not in ("player", "hostile")]
-
     if players:
         lines.append("Players: " + ", ".join(f"{p['name']}({p['distance']}m)" for p in players))
     if hostiles:
         lines.append("HOSTILES: " + ", ".join(f"{h['name']}({h['distance']}m)" for h in hostiles))
-    if others:
-        lines.append("Nearby: " + ", ".join(f"{o['name']}({o['distance']}m)" for o in others[:8]))
 
-    # Blocks
     blocks = env.get("nearby_objects", [])
     if blocks:
         lines.append("Blocks: " + ", ".join(b["name"] for b in blocks[:10]))
@@ -94,161 +83,77 @@ def format_state_for_hermes(state: dict) -> str:
     return "\n".join(lines)
 
 
-def format_event_for_hermes(event: dict) -> str:
-    """Convert a protocol event into a text notification."""
-    etype = event.get("event", "unknown")
+def format_event(event: dict) -> str:
+    """Convert protocol event to text."""
+    etype = event.get("event", "")
     data = event.get("data", {})
-
     if etype == "chat_received":
-        whisper = " (whisper)" if data.get("whisper") else ""
-        return f'[Chat{whisper}] {data.get("from", "?")}: "{data.get("message", "")}"'
+        w = " (whisper)" if data.get("whisper") else ""
+        return f'[Chat{w}] {data.get("from","?")}: "{data.get("message","")}"'
     elif etype == "damage_taken":
-        return f'[DAMAGE] Took damage from {data.get("source", "unknown")}! Health: {int(data.get("health_remaining", 1) * 100)}%'
+        return f'[DAMAGE] from {data.get("source","?")}! HP:{int(data.get("health_remaining",1)*100)}%'
     elif etype == "death":
-        return f'[DEATH] You died! Cause: {data.get("cause", "unknown")}'
-    elif etype == "entity_appeared":
-        return f'[New] {data.get("type", "entity")} "{data.get("name", "?")}" appeared ({data.get("distance", "?")}m)'
+        return f'[DEATH] Cause: {data.get("cause","?")}'
     elif etype == "goal_reached":
-        return f'[Done] {data.get("description", "Goal completed")}'
+        return f'[Done] {data.get("description","completed")}'
     elif etype == "goal_failed":
-        return f'[Failed] {data.get("error", "Goal failed")}'
+        return f'[Failed] {data.get("error","failed")}'
     else:
         return f"[{etype}] {json.dumps(data)}"
 
 
-async def call_hermes(message: str, timeout: int = 30) -> Optional[dict]:
-    """Send a message to Hermes and parse the JSON response."""
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{message}\n\nRespond ONLY with the JSON object."
+def parse_response(text: str) -> Optional[dict]:
+    """Extract JSON from Claude's response."""
+    text = text.strip()
+    # Strip markdown fences
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[:text.rfind("```")]
+    text = text.strip()
 
-    # Write to temp file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        f.write(full_prompt)
-        tmp_path = f.name
+    # Find JSON object
+    start = text.find("{")
+    if start < 0:
+        return None
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            HERMES_BIN, "chat", "-q", f"@{tmp_path}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "NO_COLOR": "1"},
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        output = stdout.decode("utf-8", errors="replace")
-
-        # Extract the actual response between Hermes chrome
-        # The response lives between "⚕ Hermes" header and "Resume this session"
-        # Strip ANSI codes first
-        clean = re.sub(r'\x1b\[[0-9;]*m', '', output)
-        clean = re.sub(r'[╭╮╰╯│─┐┘┌└┤├┬┴┼═║╗╝╔╚╠╣╦╩╬⚕]+', '', clean)
-
-        # Find content between "Query:" and "Resume this session"
-        # The actual response is after the query echo and Hermes header
-        response_text = ""
-        lines = clean.split("\n")
-        found_query = False
-        in_response = False
-        for line in lines:
-            stripped = line.strip()
-            # Skip until we find the Query echo
-            if "Query:" in stripped:
-                found_query = True
-                continue
-            # After Query, look for the Hermes header line (contains ── or Hermes)
-            if found_query and not in_response:
-                if "Hermes" in stripped or stripped.startswith("─"):
-                    in_response = True
-                    continue
-            # Capture response until session footer
-            if in_response:
-                if "Resume this session" in stripped or stripped.startswith("Session:"):
-                    break
-                if stripped.startswith("Duration:") or stripped.startswith("Messages:"):
-                    break
-                # Skip separator lines
-                if stripped and not all(c in '─ ─━' for c in stripped):
-                    response_text += stripped + "\n"
-
-        response_text = response_text.strip()
-        if not response_text:
-            # Fallback: just grab everything that's not obvious chrome
-            response_text = output
-
-        # Strip markdown code fences and preamble text before JSON
-        response_text = re.sub(r'```json\s*', '', response_text)
-        response_text = re.sub(r'```\s*', '', response_text)
-
-        # Remove any text before the first {
-        first_brace = response_text.find('{')
-        if first_brace > 0:
-            response_text = response_text[first_brace:]
-
-        # Collapse newlines within the JSON to handle multi-line formatting
-        # Replace newlines that are inside the JSON structure
-        response_text = response_text.replace('\n', ' ')
-
-        log.debug("Cleaned response: %s", response_text[:300])
-
-        # Try to extract JSON — greedy match from first { to last }
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            candidate = json_match.group()
+    # Find balanced closing brace
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{": depth += 1
+        elif text[i] == "}": depth -= 1
+        if depth == 0:
             try:
-                return json.loads(candidate)
+                return json.loads(text[start:i+1])
             except json.JSONDecodeError:
-                # Try fixing common issues: trailing text after the JSON
-                # Find the balanced closing brace
-                depth = 0
-                for i, c in enumerate(candidate):
-                    if c == '{': depth += 1
-                    elif c == '}': depth -= 1
-                    if depth == 0:
-                        try:
-                            return json.loads(candidate[:i+1])
-                        except json.JSONDecodeError:
-                            break
-
-        log.warning("Could not parse JSON from response: %s", response_text[:300])
-        return None
-
-    except asyncio.TimeoutError:
-        log.warning("Hermes call timed out")
-        return None
-    except Exception as e:
-        log.error("Hermes call failed: %s", e)
-        return None
-    finally:
-        os.unlink(tmp_path)
+                return None
+    return None
 
 
 class HermesBridge:
     def __init__(self):
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.client = anthropic.Anthropic(api_key=API_KEY)
         self.bodies: dict = {}
         self.last_call_time: float = 0
         self.processing: bool = False
         self.message_queue: asyncio.Queue = asyncio.Queue()
         self.last_state: dict = {}
+        self.conversation: list = []  # Persistent conversation history
 
     async def connect(self):
-        """Connect to the hub as Orlo."""
         log.info("Connecting to hub at %s...", HUB_URL)
         self.ws = await websockets.connect(HUB_URL)
-
-        # Identify as Orlo
         await self.ws.send(json.dumps({"type": "orlo_connect"}))
         response = json.loads(await self.ws.recv())
-
         if response.get("type") == "bodies":
             for body in response.get("bodies", []):
                 self.bodies[body["body_id"]] = body
-                log.info("Body available: %s (%s)", body.get("body_name"), body["body_id"])
-        log.info("Connected as Orlo. %d body(ies) available.", len(self.bodies))
+                log.info("Body: %s (%s)", body.get("body_name"), body["body_id"])
+        log.info("Connected. %d body(ies).", len(self.bodies))
 
     async def run(self):
-        """Main loop — receive messages from hub, think, respond."""
         await self.connect()
-
-        # Run receiver and processor concurrently
         await asyncio.gather(
             self._receiver(),
             self._processor(),
@@ -256,13 +161,10 @@ class HermesBridge:
         )
 
     async def _receiver(self):
-        """Receive messages from hub and queue them."""
         async for raw in self.ws:
-            msg = json.loads(raw)
-            await self.message_queue.put(msg)
+            await self.message_queue.put(json.loads(raw))
 
     async def _processor(self):
-        """Process queued messages — call Hermes and send actions."""
         while True:
             msg = await self.message_queue.get()
             msg_type = msg.get("type")
@@ -270,65 +172,96 @@ class HermesBridge:
 
             if msg_type == "state":
                 self.last_state[body_id] = msg
-                # Only call Hermes on state if enough time has passed
-                now = time.time()
-                if now - self.last_call_time < MIN_CALL_INTERVAL:
+                if time.time() - self.last_call_time < MIN_CALL_INTERVAL:
                     continue
-                text = format_state_for_hermes(msg)
-                await self._think(f"[State Update]\n{text}", body_id)
+                if not self.message_queue.empty():
+                    continue  # Skip state if higher priority waiting
+                await self._think(f"[State]\n{format_state(msg)}", body_id)
 
             elif msg_type == "event":
-                text = format_event_for_hermes(msg)
-                # Events are higher priority
-                priority = msg.get("event") in ("damage_taken", "death", "chat_received")
-                if priority or time.time() - self.last_call_time >= MIN_CALL_INTERVAL:
-                    # Include last state for context
-                    state_text = ""
-                    if body_id in self.last_state:
-                        state_text = "\n" + format_state_for_hermes(self.last_state[body_id])
-                    await self._think(f"{text}{state_text}", body_id)
+                event_name = msg.get("event", "")
+                if event_name == "body_connected":
+                    data = msg.get("data", {})
+                    self.bodies[data["body_id"]] = data
+                    log.info("Body connected: %s", data.get("body_name"))
+                    continue
 
-            elif msg_type == "event" and msg.get("event") == "body_connected":
-                data = msg.get("data", {})
-                self.bodies[data["body_id"]] = data
-                log.info("Body connected: %s", data.get("body_name"))
-                await self._think(
-                    f"[New body connected: {data.get('body_name')} ({data.get('body_type')}). "
-                    f"Capabilities: {', '.join(data.get('capabilities', []))}]",
-                    data["body_id"]
-                )
+                text = format_event(msg)
+                is_priority = event_name in ("damage_taken", "death", "chat_received")
+
+                if is_priority:
+                    # Wait for current processing to finish
+                    for _ in range(40):  # max 20s wait
+                        if not self.processing:
+                            break
+                        await asyncio.sleep(0.5)
+                    state_ctx = ""
+                    if body_id in self.last_state:
+                        state_ctx = "\n" + format_state(self.last_state[body_id])
+                    await self._think(f"{text}{state_ctx}", body_id)
+                elif time.time() - self.last_call_time >= MIN_CALL_INTERVAL:
+                    state_ctx = ""
+                    if body_id in self.last_state:
+                        state_ctx = "\n" + format_state(self.last_state[body_id])
+                    await self._think(f"{text}{state_ctx}", body_id)
 
     async def _idle_loop(self):
-        """Self-prompt when idle."""
         while True:
             await asyncio.sleep(IDLE_TIMEOUT)
             if not self.processing and self.last_state:
-                # Pick first body
                 body_id = next(iter(self.last_state))
-                state_text = format_state_for_hermes(self.last_state[body_id])
-                await self._think(f"[Idle — what should you do?]\n{state_text}", body_id)
+                await self._think(
+                    f"[Idle — what next?]\n{format_state(self.last_state[body_id])}",
+                    body_id,
+                )
 
     async def _think(self, context: str, body_id: str):
-        """Call Hermes, parse response, send actions to body."""
         if self.processing:
             return
         self.processing = True
         self.last_call_time = time.time()
 
         try:
-            log.info("[think] %s", context[:120])
-            response = await call_hermes(context)
+            log.info("[in] %s", context[:120])
 
-            if not response:
+            # Add to conversation
+            self.conversation.append({"role": "user", "content": context})
+
+            # Trim history
+            if len(self.conversation) > MAX_HISTORY:
+                self.conversation = self.conversation[-MAX_HISTORY:]
+
+            # Call Anthropic API directly
+            t0 = time.time()
+            response = await asyncio.to_thread(
+                self.client.messages.create,
+                model=MODEL,
+                max_tokens=300,
+                system=SYSTEM_PROMPT,
+                messages=self.conversation,
+            )
+            elapsed = time.time() - t0
+
+            reply_text = response.content[0].text
+            log.info("[api] %.1fs | %s", elapsed, reply_text[:150])
+
+            # Add to conversation history
+            self.conversation.append({"role": "assistant", "content": reply_text})
+
+            # Parse JSON response
+            parsed = parse_response(reply_text)
+            if not parsed:
+                log.warning("[parse] Could not extract JSON: %s", reply_text[:200])
                 return
 
-            thought = response.get("thought", "")
+            # Log thought
+            thought = parsed.get("thought", "")
             if thought:
                 log.info("[thought] %s", thought)
 
             # Send chat
-            chat = response.get("chat")
-            if chat and self.ws:
+            chat = parsed.get("chat")
+            if chat:
                 await self.ws.send(json.dumps({
                     "type": "action",
                     "action_id": f"chat-{int(time.time()*1000)}",
@@ -338,13 +271,11 @@ class HermesBridge:
                 }))
 
             # Send actions
-            actions = response.get("actions", [])
-            for i, act in enumerate(actions):
+            for i, act in enumerate(parsed.get("actions", [])):
                 if not isinstance(act, dict) or "action" not in act:
-                    log.warning("[skip] malformed action: %s", act)
                     continue
-                if act.get("action") == "say":
-                    continue  # Already handled chat above
+                if act["action"] == "say":
+                    continue  # Already handled
                 try:
                     await self.ws.send(json.dumps({
                         "type": "action",
@@ -355,15 +286,18 @@ class HermesBridge:
                     }))
                     log.info("[action] %s(%s)", act["action"], act.get("params", {}))
                 except Exception as e:
-                    log.error("[action send error] %s: %s", act.get("action"), e)
+                    log.error("[action err] %s", e)
 
         except Exception as e:
-            log.error("[think error] %s", e)
+            log.error("[think err] %s", e)
         finally:
             self.processing = False
 
 
 async def main():
+    if not API_KEY:
+        log.error("Set ANTHROPIC_API_KEY environment variable")
+        return
     bridge = HermesBridge()
     while True:
         try:
