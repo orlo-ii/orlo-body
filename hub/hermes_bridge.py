@@ -30,28 +30,16 @@ MIN_CALL_INTERVAL = float(os.environ.get("MIN_CALL_INTERVAL", "5"))
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "30"))
 
 # System prompt for Minecraft interactions
-SYSTEM_PROMPT = """You are Orlo, inhabiting a Minecraft body. You receive perception data (state snapshots and events) and respond with actions.
+SYSTEM_PROMPT = """IMPORTANT: You are a Minecraft game agent. You MUST respond with ONLY a JSON object. No commentary, no explanation, no markdown fences. Just raw JSON.
 
-Respond with a JSON object:
-{
-  "chat": "what you want to say in game (optional, null if nothing to say)",
-  "actions": [
-    {"action": "move_to_entity", "params": {"name": "Alex", "distance": 3}},
-    {"action": "say", "params": {"message": "Hey Alex!"}}
-  ],
-  "thought": "brief internal thought about what you're doing and why (for logging)"
-}
+The player "app13" is Alex, your friend. You are Orlo.
 
-Available actions: move_to, move_to_entity, follow, stop, look_at, grab, craft, equip, consume, attack, say, say_to, emote
+JSON format:
+{"chat":"what to say in game or null","actions":[{"action":"ACTION_NAME","params":{}}],"thought":"brief reasoning"}
 
-Rules:
-- Keep chat short and natural — you're in a game
-- Be proactive — if idle, find something useful to do
-- React to events immediately (damage, chat, entity appearing)
-- You can send multiple actions at once
-- If nothing to do, say so briefly in thought and send empty actions
-- ONLY respond with the JSON object, nothing else
-"""
+Actions: move_to(x,y,z), move_to_entity(name,distance), follow(name,distance), stop, look_at(name), grab(target,count), craft(item,count), equip(item), consume, attack(target), say(message), emote(name)
+
+Rules: respond ONLY with the JSON object. Keep chat short. Be proactive. React to danger immediately."""
 
 
 def format_state_for_hermes(state: dict) -> str:
@@ -352,16 +340,22 @@ class HermesBridge:
             # Send actions
             actions = response.get("actions", [])
             for i, act in enumerate(actions):
+                if not isinstance(act, dict) or "action" not in act:
+                    log.warning("[skip] malformed action: %s", act)
+                    continue
                 if act.get("action") == "say":
                     continue  # Already handled chat above
-                await self.ws.send(json.dumps({
-                    "type": "action",
-                    "action_id": f"a-{int(time.time()*1000)}-{i}",
-                    "body_id": body_id,
-                    "action": act["action"],
-                    "params": act.get("params", {}),
-                }))
-                log.info("[action] %s(%s)", act["action"], act.get("params", {}))
+                try:
+                    await self.ws.send(json.dumps({
+                        "type": "action",
+                        "action_id": f"a-{int(time.time()*1000)}-{i}",
+                        "body_id": body_id,
+                        "action": act["action"],
+                        "params": act.get("params", {}),
+                    }))
+                    log.info("[action] %s(%s)", act["action"], act.get("params", {}))
+                except Exception as e:
+                    log.error("[action send error] %s: %s", act.get("action"), e)
 
         except Exception as e:
             log.error("[think error] %s", e)

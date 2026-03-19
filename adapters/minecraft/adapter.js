@@ -157,19 +157,21 @@ async function executeAction(msg) {
   const ack = (status) => hub.send(JSON.stringify({ type: 'action_ack', action_id, status }));
 
   try {
+    const movements = new Movements(bot);
     switch (action) {
       // Movement
       case 'move_to': {
-        const movements = new Movements(bot);
+        console.log(`[move_to] Navigating to ${params.x}, ${params.y}, ${params.z}`);
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.setGoal(new GoalNear(params.x, params.y, params.z, 2));
         ack('started');
         break;
       }
       case 'move_to_entity': {
-        const player = bot.players[params.name];
-        if (!player?.entity) { ack('error: entity not found'); break; }
-        const movements = new Movements(bot);
+        const targetName = params.name || params.entity;
+        const player = bot.players[targetName];
+        if (!player?.entity) { ack('error: entity not found: ' + targetName); break; }
+        console.log(`[move_to_entity] Moving to ${targetName}`);
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.setGoal(new GoalNear(
           player.entity.position.x, player.entity.position.y, player.entity.position.z,
@@ -179,9 +181,10 @@ async function executeAction(msg) {
         break;
       }
       case 'follow': {
-        const target = bot.players[params.name];
-        if (!target?.entity) { ack('error: entity not found'); break; }
-        const movements = new Movements(bot);
+        const followName = params.name || params.entity;
+        const target = bot.players[followName];
+        if (!target?.entity) { ack('error: entity not found: ' + followName); break; }
+        console.log(`[follow] Following ${followName}`);
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.setGoal(new GoalFollow(target.entity, params.distance || 4), true);
         ack('started');
@@ -194,14 +197,22 @@ async function executeAction(msg) {
         break;
       }
       case 'look_at': {
-        if (params.entity) {
-          const p = bot.players[params.entity];
-          if (p?.entity) await bot.lookAt(p.entity.position.offset(0, 1.6, 0));
+        const lookTarget = params.entity || params.name;
+        if (lookTarget) {
+          const p = bot.players[lookTarget];
+          if (p?.entity) {
+            await bot.lookAt(p.entity.position.offset(0, 1.6, 0));
+            ack('completed');
+          } else {
+            ack('error: player not found: ' + lookTarget);
+          }
         } else if (params.x !== undefined) {
           const { Vec3 } = require('vec3');
           await bot.lookAt(new Vec3(params.x, params.y, params.z));
+          ack('completed');
+        } else {
+          ack('error: no target specified');
         }
-        ack('completed');
         break;
       }
 
